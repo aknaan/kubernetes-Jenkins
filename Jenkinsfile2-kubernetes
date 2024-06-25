@@ -1,0 +1,124 @@
+pipeline {
+    
+    agent {
+        label 'agent1'
+    }
+    
+     environment {
+        DOCKERHUB_CREDENTIALS=credentials('Jenkins_dockerhub')
+        ERROR='none'
+	def commit_hash=sh(returnStdout: true, script: "git log -1 --pretty=format:%h")
+	IMAGE_HUSH="${env.BUILD_NUMBER}_${commit_hash}"
+    }
+	stages {	
+
+        stage('Build') {
+            steps {
+                script{
+                    try{
+                        sh 'docker build -t weather-app-with-k8s --no-cache .'
+                        sh 'docker run -d -p 80:80 --restart unless-stopped weather-app-with-k8s'
+                    }
+                    
+                    catch(error){
+                        ERROR='Build failed'
+                        throw error
+                    }
+                }
+            }
+        }
+        
+        stage('test') {
+            steps {
+                script{
+                    try{
+                        dir('tests') {
+                        sh 'pip install -r requirements.txt --break-system-packages'
+                        sh 'python3 -m pytest test2.py'
+                        }
+                    }
+                    
+                    catch(error){
+                        ERROR='testing failed'
+                        throw error
+                    }
+                }
+            }          
+        }
+        
+        stage('Login to Docker Hub') {         
+            steps{
+                script{
+                    try{
+                        sh 'echo $DOCKERHUB_CREDENTIALS_PSW | docker login -u $DOCKERHUB_CREDENTIALS_USR --password-stdin'
+                    }
+                    catch(error){
+                        ERROR='Login to dockerhub failed'
+                        throw error
+                    }
+                }
+            }           
+        } 
+        
+        stage('Push Image to Docker Hub') {         
+            steps{
+                script{
+                    try{
+			def commit_hash=sh(returnStdout: true, script: "git log -1 --pretty=format:%h")
+			sh "docker tag weather-app-with-k8s aknaan/weather-app-with-k8s:${IMAGE_HUSH}"
+                        sh "docker push aknaan/weather-app-with-k8s:${IMAGE_HUSH}"
+                    }
+                
+                    catch(error){
+                        ERROR='Push to dockerhub failed'
+                        throw error
+                    }
+                }
+            }           
+        }
+        
+        stage("Deploy to EC2 instance") {
+            steps {
+                script {
+
+                   sshagent(['kubernetes'])  {
+
+					try {
+						sh "sed -i 's/replicas: [0-9]*/replicas: ${params.REPLICAS}/' deployment.yaml"
+						sh '''#!/bin/bash
+							IMAGE_TAG=\"${IMAGE_HUSH}\" envsubst ${IMAGE_TAG} < deployment.yaml > final_deployment.yaml'''
+						sh "cat final_deployment.yaml"
+						def cmd = "kubectl apply -f final_deployment.yaml"
+						sh "scp -o StrictHostKeyChecking=no final_deployment.yaml ubuntu@172.31.19.9:/home/ubuntu"
+						sh "ssh -o StrictHostKeyChecking=no ubuntu@172.31.19.9 ${cmd}"
+					}
+						catch(error){
+							echo 'connection to kubernetes failed'
+							ERROR='connection to kubernetes failed'
+							throw error
+					}
+				}
+                    	}
+                }
+            }
+        }
+   
+        post {
+            success {
+                slackSend color: "good", message: "Status of Pipeline:\n${currentBuild.currentResult} ${env.JOB_NAME} \nbuild-number:\n${IMAGE_HUSH}"
+            }
+       
+            failure {
+                slackSend channel: 'devops-alerts', message: "$ERROR"
+            }
+
+	 always {
+                sh 'docker stop $(docker ps -a -q)'
+                sh 'docker rm $(docker ps -a -q)'
+                sh 'docker rmi -f $(docker images -a -q)'
+                sh 'docker system prune -f'
+
+            }
+
+        }
+}
